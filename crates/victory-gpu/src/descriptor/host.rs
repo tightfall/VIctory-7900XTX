@@ -2850,6 +2850,25 @@ impl HostHeap {
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.keep(index, kept.flatten());
+        self.note_records(index, view_records(view));
+    }
+
+    /// Writes slot `index`'s record count into the host's table by heap slot
+    /// (`victory_shader::emit::SLOT_COUNTS_AT`). The dynamic slots of a
+    /// draw's tables are made here, not through [`HostHeap::note_buffer`], and
+    /// shaders read a table view's count at its dynamic slot: without this a
+    /// table's buffers read 0 or the count of a view that held the slot
+    /// before (the faces' network, which sizes its tensors so, computed
+    /// zeros and the faces stood still).
+    fn note_records(&self, index: u32, records: u32) {
+        if let Some((_, _, data)) = &self.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let counts = victory_shader::emit::SLOT_COUNTS_AT as usize;
+            // SAFETY: inside the mapping; shaders read it while we write (a
+            // dword, either value is one the slot had).
+            unsafe { (*data as *mut u32).add(counts + index as usize).write_volatile(records) };
+        }
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -2887,10 +2906,12 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                views.made.insert(words, ListView { view, at, twin, kept, listed });
+                let records = view_records(&view);
+                views.made.insert(words, ListView { view, at, twin, kept, listed, records });
             }
             let made = &views.made[&words];
             self.copy_from(index, views.slot(made.at));
+            self.note_records(index, made.records);
             if made.twin && twins {
                 self.copy_from(self.raw + index, views.slot(made.at + 1));
                 self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2921,6 +2942,7 @@ impl HostHeap {
         } else {
             null_view(self.at(index));
             self.put(index);
+            self.note_records(index, 0);
         }
         self.clear_twin(index);
         self.keep(index, None);
@@ -6055,6 +6077,39 @@ mod tests {
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
     }
 
+    /// A draw's table slots are dynamic ones, made by `make_at` (or copied by
+    /// `make_listed`), not mirrored: their record counts must still reach
+    /// the table shaders read them from, and a slot made null reads 0.
+    #[test]
+    fn a_dynamic_slots_record_count_is_written_where_shaders_read_it() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            eprintln!("no host descriptor heap; skipped");
+            return;
+        };
+        let Some(data) = heap.strides.as_ref().map(|s| s.2) else {
+            eprintln!("no table of strides; skipped");
+            return;
+        };
+        let count = |index: u32| {
+            // SAFETY: inside the table's mapping.
+            unsafe { (data as *const u32).add(victory_shader::emit::SLOT_COUNTS_AT as usize + index as usize).read_volatile() }
+        };
+        // UAV descriptions: format, dimension (buffer), first element, count, stride, counter, flags.
+        const R16G16B16A16_UINT: u32 = 12;
+        const R32_TYPELESS: u32 = 1;
+        const RAW: u32 = 1;
+        let typed = View::Unordered(0, 0, Some([R16G16B16A16_UINT, 1, 0, 0, 64, 0, 0, 0, 0, 0]));
+        let raw = View::Unordered(0, 0, Some([R32_TYPELESS, 1, 0, 0, 64, 0, 0, 0, RAW, 0]));
+        let index = heap.dynamic(2).unwrap();
+        heap.make_at(index, &typed);
+        heap.make_at(index + 1, &raw);
+        assert_eq!((count(index), count(index + 1)), (64, 256), "elements of a typed view, bytes of a raw one");
+        // The slot made again for another draw: no count left over.
+        heap.make_null(index);
+        assert_eq!(count(index), 0);
+        heap.release(index, 2);
+    }
+
     #[test]
     fn dynamic_slots_are_held_until_released() {
         let Some(heap) = HostHeap::new(false, 4) else {
@@ -6118,6 +6173,8 @@ struct ListView {
     twin: bool,
     kept: Kept,
     listed: Listed,
+    /// Its record count ([`view_records`]), written for each slot it is copied to.
+    records: u32,
 }
 
 /// The descriptors a thread made for one recording of a list, by the record
